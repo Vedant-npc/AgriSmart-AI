@@ -1,0 +1,296 @@
+/* Hyperlocal AI Agent for Agriculture — Full starter (React single-file + backend example)
+
+This file contains:
+  1) A React frontend component (default export) with:
+     - Text chat UI, voice input (Web Speech API), image upload, geolocation
+     - Offline queue (localStorage) and retry-on-connect
+     - Simple conversation history, attachments preview
+     - Configurable backend endpoint: /api/agent
+  2) Example Node/Express backend (comment block) that accepts multimodal inputs
+     and forwards them to a generic multimodal LLM provider. Replace provider
+     code with your chosen API (OpenAI, Anthropic, Azure, etc.).
+
+Drop this into a React app. Tailwind classes are used (optional). For production,
+separate files, environment vars, API key storage, and security must be added.
+*/
+
+import React, { useState, useEffect, useRef } from 'react';
+
+// ------------------ Frontend Component ------------------
+export default function HyperlocalAIAgriAgent({ apiBase = '/api/agent' }) {
+  const [messages, setMessages] = useState(() => {
+    try { return JSON.parse(localStorage.getItem('agri_chat_history') || 'null') || [] } catch (e) { return [] }
+  });
+  const [input, setInput] = useState('');
+  const [imageFile, setImageFile] = useState(null);
+  const [sending, setSending] = useState(false);
+  const [listening, setListening] = useState(false);
+  const [isOnline, setIsOnline] = useState(navigator.onLine);
+  const [queued, setQueued] = useState(() => JSON.parse(localStorage.getItem('agri_offline_queue') || '[]'));
+  const fileRef = useRef(null);
+  const synthRef = useRef(null);
+
+  useEffect(() => {
+    localStorage.setItem('agri_chat_history', JSON.stringify(messages));
+  }, [messages]);
+
+  useEffect(() => {
+    localStorage.setItem('agri_offline_queue', JSON.stringify(queued));
+  }, [queued]);
+
+  useEffect(() => {
+    function onOnline() { setIsOnline(true); flushQueue(); }
+    function onOffline() { setIsOnline(false); }
+    window.addEventListener('online', onOnline);
+    window.addEventListener('offline', onOffline);
+    return () => { window.removeEventListener('online', onOnline); window.removeEventListener('offline', onOffline); }
+  }, [queued]);
+
+  async function flushQueue() {
+    if (!navigator.onLine || queued.length === 0) return;
+    const queueCopy = [...queued];
+    for (const q of queueCopy) {
+      try {
+        await sendToServer(q.form, q.meta, false);
+        // remove first
+        queued.shift();
+        setQueued([...queued]);
+      } catch (e) {
+        console.warn('Failed to flush queued item, will retry later', e);
+        break; // stop -- network unstable
+      }
+    }
+  }
+
+  function addMessage(msg) {
+    setMessages(m => [...m, { id: Date.now() + Math.random(), ...msg }]);
+  }
+
+  async function handleSend(e) {
+    e && e.preventDefault();
+    if (!input.trim() && !imageFile) return;
+    const meta = { timestamp: new Date().toISOString() };
+    addMessage({ from: 'user', text: input || (imageFile ? '[image]' : ''), meta });
+
+    const form = new FormData();
+    form.append('message', input);
+    if (imageFile) form.append('image', imageFile);
+
+    // attach location if available (best-effort)
+    if (navigator.geolocation) {
+      try {
+        const pos = await new Promise((res, rej) => navigator.geolocation.getCurrentPosition(res, rej, { timeout: 7000 }));
+        form.append('geo', JSON.stringify({ lat: pos.coords.latitude, lon: pos.coords.longitude }));
+      } catch (err) {
+        // ignore if user denies or times out
+      }
+    }
+
+    if (!navigator.onLine) {
+      // queue for later
+      setQueued(q => { const n = [...q, { form: serializeForm(form), meta }]; return n; });
+      addMessage({ from: 'bot', text: 'Queued — will send once connection returns.', meta });
+    } else {
+      await sendToServer(form, meta, true);
+    }
+
+    setInput('');
+    setImageFile(null);
+    if (fileRef.current) fileRef.current.value = null;
+  }
+
+  function serializeForm(form) {
+    // convert FormData to simple JSON for offline queue. Images will be dropped.
+    const obj = {};
+    for (const [k, v] of form.entries()) {
+      if (v instanceof File) {
+        obj[k] = { filename: v.name, size: v.size, type: v.type };
+      } else obj[k] = v;
+    }
+    return obj;
+  }
+
+  async function sendToServer(form, meta, showProgress) {
+    setSending(true);
+    try {
+      // If FormData-like object was serialized (from queue), convert to real FormData
+      if (!(form instanceof FormData)) {
+        const f = new FormData();
+        for (const k of Object.keys(form)) {
+          f.append(k, form[k]);
+        }
+        form = f;
+      }
+
+      const res = await fetch(apiBase, { method: 'POST', body: form });
+      if (!res.ok) throw new Error(`Server ${res.status}`);
+      const json = await res.json();
+      // expected { reply: string, actions?: [], sources?: [] }
+      addMessage({ from: 'bot', text: json.reply || 'No reply from agent', meta: { ...meta, sources: json.sources || [] } });
+      // speak reply if TTS available
+      if (json.reply && window.speechSynthesis) {
+        const u = new SpeechSynthesisUtterance(json.reply);
+        // try to pick a regional voice if possible (simple heuristic)
+        const voices = window.speechSynthesis.getVoices();
+        if (voices && voices.length) u.voice = voices.find(v => /female|female/i.test(v.name)) || voices[0];
+        window.speechSynthesis.cancel();
+        window.speechSynthesis.speak(u);
+      }
+    } catch (err) {
+      console.error('send error', err);
+      addMessage({ from: 'bot', text: 'Error contacting agent. Your request may be queued.' });
+      // queue as fallback (without images)
+      setQueued(q => [...q, { form: serializeForm(form), meta }]);
+    } finally { setSending(false); }
+  }
+
+  function handleFile(e) {
+    const f = e.target.files?.[0] || null;
+    if (!f) return;
+    if (f.size > 10 * 1024 * 1024) { alert('Max 10MB.'); e.target.value = null; return; }
+    setImageFile(f);
+  }
+
+  // Voice input using Web Speech API (best-effort)
+  const recognitionRef = useRef(null);
+  function toggleListen() {
+    if (!('webkitSpeechRecognition' in window) && !('SpeechRecognition' in window)) {
+      alert('Speech recognition not supported in this browser.');
+      return;
+    }
+    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!recognitionRef.current) {
+      const r = new SpeechRecognition();
+      r.lang = 'en-IN';
+      r.interimResults = false;
+      r.onresult = (ev) => {
+        const t = ev.results[0][0].transcript;
+        setInput(prev => (prev ? prev + ' ' : '') + t);
+      };
+      r.onend = () => { setListening(false); recognitionRef.current = null; };
+      recognitionRef.current = r;
+      setListening(true);
+      r.start();
+    } else {
+      recognitionRef.current.stop();
+      recognitionRef.current = null;
+      setListening(false);
+    }
+  }
+
+  return (
+    <div className="max-w-3xl mx-auto p-4">
+      <h1 className="text-2xl font-semibold mb-3">Hyperlocal AI — Agri Assistant</h1>
+
+      <div className="bg-white border rounded-lg shadow-sm p-4 h-[60vh] overflow-y-auto mb-4">
+        {messages.length === 0 && <div className="text-gray-500">Start by asking a question or upload a photo of the crop/pest.</div>}
+        {messages.map(m => (
+          <div key={m.id} className={`mb-3 ${m.from === 'user' ? 'text-right' : 'text-left'}`}>
+            <div className={`inline-block p-3 rounded-lg ${m.from === 'user' ? 'bg-green-50' : 'bg-gray-50'}`}>
+              <div className="text-sm whitespace-pre-wrap">{m.text}</div>
+              {m.meta?.sources && m.meta.sources.length > 0 && (
+                <div className="text-xs text-gray-400 mt-1">Sources: {m.meta.sources.join(', ')}</div>
+              )}
+            </div>
+          </div>
+        ))}
+      </div>
+
+      <form onSubmit={handleSend} className="flex flex-col gap-2">
+        <textarea value={input} onChange={e => setInput(e.target.value)} placeholder="Type your question (e.g., 'What is this pest?')" className="w-full p-2 border rounded h-20 resize-none" />
+
+        <div className="flex items-center gap-2">
+          <input ref={fileRef} type="file" accept="image/*" onChange={handleFile} />
+          <button type="button" onClick={() => fileRef.current && fileRef.current.click()} className="px-3 py-1 rounded border">Upload Image</button>
+          {imageFile && <div className="text-sm">Selected: {imageFile.name}</div>}
+
+          <button type="button" onClick={toggleListen} className="px-3 py-1 rounded border">{listening ? 'Stop' : 'Voice'}</button>
+
+          <div className="flex-1" />
+          <button type="submit" disabled={sending} className="px-4 py-2 rounded bg-blue-600 text-white">{sending ? 'Sending...' : 'Send'}</button>
+        </div>
+
+        <div className="flex justify-between text-xs text-gray-500">
+          <div>{isOnline ? 'Online' : 'Offline — queued'}</div>
+          <div>{queued.length} queued</div>
+        </div>
+      </form>
+    </div>
+  );
+}
+
+/* ------------------ Backend Example (Node + Express) ------------------
+
+Save as server.js. Replace multimodal provider code with your chosen API.
+
+npm packages: express multer node-fetch form-data dotenv
+
+*/
+
+/*
+const express = require('express');
+const multer = require('multer');
+const fs = require('fs');
+const fetch = require('node-fetch');
+const FormData = require('form-data');
+require('dotenv').config();
+
+const upload = multer({ dest: 'uploads/' });
+const app = express();
+app.use(express.json());
+
+// Basic POST handler for /api/agent
+app.post('/api/agent', upload.single('image'), async (req, res) => {
+  try {
+    const userMessage = req.body.message || '';
+    const geo = req.body.geo ? JSON.parse(req.body.geo) : null;
+    const imageFile = req.file ? req.file.path : null;
+
+    // Build system + user prompt
+    const systemPrompt = `You are a helpful agricultural assistant. Provide concise, actionable, and safe advice. If you provide recommendations, include a short list of immediate steps and at most 3 references to public datasets.`;
+
+    let userPrompt = `User message: ${userMessage}\n`;
+    if (geo) userPrompt += `Location: lat=${geo.lat}, lon=${geo.lon}\n`;
+    userPrompt += `Provide diagnoses, likely causes, immediate mitigations, and suggestions for markets or inputs if relevant.`;
+
+    // Example: placeholder call to a hypothetical multimodal model endpoint
+    const form = new FormData();
+    form.append('system', systemPrompt);
+    form.append('user', userPrompt);
+    if (imageFile) form.append('image', fs.createReadStream(imageFile));
+
+    // Replace the URL and authorization with your provider
+    const providerRes = await fetch('https://api.your-multimodal-provider.com/v1/interpret', {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${process.env.PROVIDER_API_KEY}` },
+      body: form
+    });
+
+    const providerJson = await providerRes.json();
+
+    // Clean up uploaded file
+    if (imageFile) fs.unlinkSync(imageFile);
+
+    // Map provider response -> { reply, sources }
+    const reply = providerJson.reply || providerJson.answer || 'Sorry, no answer.';
+    const sources = providerJson.sources || [];
+
+    res.json({ reply, sources });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'server error' });
+  }
+});
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log('Server running on', PORT));
+*/
+
+/* ------------------ Integration Notes ------------------
+- Provider integration: Replace the provider API URL and payload to match your LLM's multimodal API.
+- For OpenAI: you'd call a chat/completions endpoint with system/user messages and attach an image if your plan supports it.
+- Always validate and sanitize user inputs. Keep API keys server-side.
+- For offline areas: consider SMS/USSD or IVR fallbacks. You can also build an Android PWA that stores data locally and syncs.
+- For transparency: include a 'sources' field in replies linking to public datasets (weather, soil, extension docs).
+- For safety: avoid giving legal/medical advice. Use conservative phrasing and ask follow-ups when unsure.
+*/
